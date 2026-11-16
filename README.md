@@ -44,6 +44,9 @@ uv pip install openwebui-mcp-server
 
 ## Configuration
 
+`WEBUI_URL` and `WEBUI_API_KEY` work as alternatives to `OPENWEBUI_URL` and
+`OPENWEBUI_API_KEY`. Every tool carries a Read or Write annotation.
+
 Copy the example file and set the required Open WebUI management credential:
 
 ```bash

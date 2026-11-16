@@ -19,6 +19,7 @@ from fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field, model_validator
 
 from .client import OpenWebUIClient
+from .redact import redact
 
 # Context variable to store the current user's token
 _current_user_token: ContextVar[Optional[str]] = ContextVar("current_user_token", default=None)
@@ -92,6 +93,93 @@ class AuthMiddleware:
 # Initialize MCP server
 mcp = FastMCP("openwebui-mcp-server")
 
+# Every tool is registered as Read or Write (MCP tool annotations) so clients and
+# MCP hubs can group them and ask before writes. A tool not listed here is a Write.
+READ_TOOLS = frozenset(
+    {
+        "export_config",
+        "get_banners",
+        "get_channel",
+        "get_channel_messages",
+        "get_chat",
+        "get_config_namespace",
+        "get_config_values",
+        "get_current_user",
+        "get_default_prompt_suggestions",
+        "get_file",
+        "get_file_content",
+        "get_folder",
+        "get_function",
+        "get_group",
+        "get_knowledge_base",
+        "get_model",
+        "get_model_connections",
+        "get_model_history",
+        "get_models_config",
+        "get_note",
+        "get_prompt",
+        "get_system_config",
+        "get_tool",
+        "get_tool_servers",
+        "get_user",
+        "list_channels",
+        "list_chats",
+        "list_files",
+        "list_folders",
+        "list_functions",
+        "list_groups",
+        "list_knowledge_bases",
+        "list_memories",
+        "list_models",
+        "list_notes",
+        "list_prompts",
+        "list_tools",
+        "list_users",
+        "query_memories",
+        "search_files",
+    }
+)
+# Writes that only add something new; every other write may change or remove data.
+ADDITIVE_WRITE_TOOLS = frozenset(
+    {
+        "add_knowledge_file",
+        "add_memory",
+        "add_user_to_group",
+        "clone_chat",
+        "create_channel",
+        "create_folder",
+        "create_function",
+        "create_group",
+        "create_knowledge_base",
+        "create_model",
+        "create_note",
+        "create_prompt",
+        "create_tool",
+        "post_channel_message",
+        "upload_file",
+    }
+)
+
+
+def tool_annotations(name: str) -> dict[str, Any]:
+    """MCP annotations for a tool: read-only, additive write, or destructive write."""
+    if name in READ_TOOLS:
+        return {"readOnlyHint": True, "openWorldHint": False}
+    return {
+        "readOnlyHint": False,
+        "destructiveHint": name not in ADDITIVE_WRITE_TOOLS,
+        "openWorldHint": False,
+    }
+
+
+def tool():
+    """Register an MCP tool with its Read/Write annotations."""
+
+    def decorator(fn):
+        return mcp.tool(annotations=tool_annotations(fn.__name__))(fn)
+
+    return decorator
+
 MEMBER_PROFILE_TOOLS = {
     "get_current_user",
     "list_models",
@@ -137,7 +225,7 @@ def get_user_token() -> Optional[str]:
     profile = os.getenv("MCP_PROFILE", "local").lower()
     if profile in {"admin", "member"}:
         raise RuntimeError("A forwarded Open WebUI session token is required for this profile")
-    return os.getenv("OPENWEBUI_API_KEY")
+    return os.getenv("OPENWEBUI_API_KEY") or os.getenv("WEBUI_API_KEY")
 
 
 async def audit_mutation(
@@ -176,7 +264,7 @@ async def audit_mutation(
         audit["note_error"] = type(exc).__name__
         logger.exception("Open WebUI mutation audit note failed for %s", action)
 
-    return {**result, "_audit": audit}
+    return {**redact(result), "_audit": audit}
 
 
 # =============================================================================
@@ -310,6 +398,51 @@ class ModelAccessParam(BaseModel):
     )
 
 
+class ModelHistoryParam(BaseModel):
+    model_id: str = Field(description="Model ID")
+    page: int = Field(default=1, ge=1, description="Page of history, 1 = newest")
+
+
+class ConfigNamespaceParam(BaseModel):
+    namespace: str = Field(
+        description=(
+            "Dotted settings namespace, such as 'rag', 'ui', 'task', 'auth', 'tool_server' "
+            "or 'openai'; every stored key under it is returned"
+        )
+    )
+
+
+class ConfigKeysParam(BaseModel):
+    keys: list[str] = Field(
+        min_length=1, description="Dotted setting keys, such as 'ui.default_models'"
+    )
+
+
+class ConfigSetParam(BaseModel):
+    values: dict[str, Any] = Field(
+        description=(
+            "Setting key -> new value, such as {'ui.default_models': 'studio.chat'}. "
+            "Only these keys change; read the current value first with get_config_values"
+        )
+    )
+    allow_new_keys: bool = Field(
+        default=False,
+        description="Allow keys that have no stored value yet; off so a typo is refused",
+    )
+
+
+class ToolServerUpdateParam(BaseModel):
+    server_id: str = Field(description="Tool server ID (info.id from get_tool_servers)")
+    enabled: Optional[bool] = Field(default=None, description="Turn the connection on or off")
+    name: Optional[str] = Field(default=None, description="New display name")
+    description: Optional[str] = Field(default=None, description="New description")
+    url: Optional[str] = Field(default=None, description="New server URL")
+    function_name_filter_list: Optional[list[str]] = Field(
+        default=None,
+        description="Exact tool names to expose; an empty list exposes all tools",
+    )
+
+
 class ModelUpdateParam(BaseModel):
     model_id: str = Field(description="Model ID")
     base_model_id: Optional[str] = Field(default=None, description="New base model ID")
@@ -348,6 +481,21 @@ class ModelUpdateParam(BaseModel):
     )
     access_grants: Optional[list[dict[str, Any]]] = Field(
         default=None, description="Open WebUI access grants"
+    )
+    params_patch: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Any other model parameters to set, by their Open WebUI key (for example "
+            "{'function_calling': 'native', 'num_ctx': 32768}). Each top-level key "
+            "replaces that key only; other parameters stay as stored"
+        ),
+    )
+    meta_patch: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model meta fields to set (for example 'capabilities', 'description', "
+            "'builtinTools'). Each top-level key is replaced whole; others stay as stored"
+        ),
     )
 
 
@@ -614,32 +762,35 @@ class ChannelMessageIdParam(BaseModel):
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def get_current_user(ctx: Context) -> dict[str, Any]:
-    """Get the currently authenticated user's profile.
-    Returns your ID, name, email, role, and permissions."""
+    """Get the permissions of the Open WebUI account this server acts as.
+
+    Open WebUI gives the full profile (id, email, role) only to a signed-in
+    browser session, never to an API key, so this returns permissions.
+    """
     return await get_client().get_current_user(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def list_users(ctx: Context) -> dict[str, Any]:
     """List all users in Open WebUI. ADMIN ONLY."""
     return await get_client().list_users(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_user(params: UserIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a specific user. ADMIN ONLY."""
     return await get_client().get_user(params.user_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_user_role(params: UserRoleParam, ctx: Context) -> dict[str, Any]:
     """Update a user's role. ADMIN ONLY. Roles: 'admin', 'user', 'pending'."""
     return await get_client().update_user_role(params.user_id, params.role, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_user(params: UserIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a user. ADMIN ONLY. WARNING: Cannot be undone!"""
     return await get_client().delete_user(params.user_id, get_user_token())
@@ -650,25 +801,25 @@ async def delete_user(params: UserIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_groups(ctx: Context) -> dict[str, Any]:
     """List all groups with their IDs, names, and member counts."""
     return await get_client().list_groups(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_group(params: GroupCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new group. ADMIN ONLY."""
     return await get_client().create_group(params.name, params.description, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_group(params: GroupIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a specific group including members."""
     return await get_client().get_group(params.group_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_group(params: GroupUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a group's name or description. ADMIN ONLY."""
     return await get_client().update_group(
@@ -676,13 +827,13 @@ async def update_group(params: GroupUpdateParam, ctx: Context) -> dict[str, Any]
     )
 
 
-@mcp.tool()
+@tool()
 async def add_user_to_group(params: GroupUserParam, ctx: Context) -> dict[str, Any]:
     """Add a user to a group. ADMIN ONLY."""
     return await get_client().add_user_to_group(params.group_id, params.user_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def remove_user_from_group(params: GroupUserParam, ctx: Context) -> dict[str, Any]:
     """Remove a user from a group. ADMIN ONLY."""
     return await get_client().remove_user_from_group(
@@ -690,7 +841,7 @@ async def remove_user_from_group(params: GroupUserParam, ctx: Context) -> dict[s
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_group(params: GroupIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a group. ADMIN ONLY. Removes all users from the group."""
     return await get_client().delete_group(params.group_id, get_user_token())
@@ -701,7 +852,7 @@ async def delete_group(params: GroupIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_models(ctx: Context, params: Optional[ModelListParam] = None) -> dict[str, Any]:
     """List models accessible to the current user.
 
@@ -721,13 +872,28 @@ async def list_models(ctx: Context, params: Optional[ModelListParam] = None) -> 
     )
 
 
-@mcp.tool()
+@tool()
 async def get_model(params: ModelIdParam, ctx: Context) -> dict[str, Any]:
-    """Get details for a specific model including system prompt and parameters."""
-    return await get_client().get_model(params.model_id, get_user_token())
+    """Get a model's saved settings (system prompt, parameters, meta, access).
+
+    Works for workspace models and for connection models. A connection model
+    whose settings were never edited has no saved record; then its live entry is
+    returned with ``stored_record: false``.
+    """
+    return await get_client().get_model_details(params.model_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
+async def get_model_history(params: ModelHistoryParam, ctx: Context) -> dict[str, Any]:
+    """List earlier saved versions of a model's settings, newest first.
+
+    Use it to see what a model looked like before a change, or to restore a
+    setting by hand with ``update_model``.
+    """
+    return await get_client().get_model_history(params.model_id, params.page, get_user_token())
+
+
+@tool()
 async def create_model(params: ModelCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a model with model-level instructions, knowledge, tools, and quick-start suggestions.
 
@@ -791,7 +957,7 @@ async def create_model(params: ModelCreateParam, ctx: Context) -> dict[str, Any]
     )
 
 
-@mcp.tool()
+@tool()
 async def update_model(params: ModelUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update model-level instructions, knowledge, tools, parameters, or quick-start suggestions.
 
@@ -828,7 +994,11 @@ async def update_model(params: ModelUpdateParam, ctx: Context) -> dict[str, Any]
     if params.system_prompt is not None:
         model_params = model_params or {}
         model_params["system"] = params.system_prompt
+    if params.params_patch:
+        model_params = {**params.params_patch, **(model_params or {})}
     model_meta = {"toolIds": params.tool_ids} if params.tool_ids is not None else None
+    if params.meta_patch:
+        model_meta = {**params.meta_patch, **(model_meta or {})}
     if params.suggestion_prompts is not None:
         model_meta = model_meta or {}
         model_meta["suggestion_prompts"] = [
@@ -866,6 +1036,8 @@ async def update_model(params: ModelUpdateParam, ctx: Context) -> dict[str, Any]
                 "knowledge_ids": params.knowledge_ids,
                 "suggestion_prompts": params.suggestion_prompts,
                 "access_grants": params.access_grants,
+                "params_patch": params.params_patch,
+                "meta_patch": params.meta_patch,
             }.items()
             if value is not None
         ],
@@ -874,7 +1046,7 @@ async def update_model(params: ModelUpdateParam, ctx: Context) -> dict[str, Any]
     )
 
 
-@mcp.tool()
+@tool()
 async def set_model_visibility(
     params: ModelVisibilityParam, ctx: Context
 ) -> dict[str, Any]:
@@ -896,7 +1068,7 @@ async def set_model_visibility(
     )
 
 
-@mcp.tool()
+@tool()
 async def set_model_enabled(params: ModelEnabledParam, ctx: Context) -> dict[str, Any]:
     """Enable or disable a base or Workspace model. ADMIN ONLY.
 
@@ -916,13 +1088,13 @@ async def set_model_enabled(params: ModelEnabledParam, ctx: Context) -> dict[str
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_model(params: ModelIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a custom model. ADMIN ONLY."""
     return await get_client().delete_model(params.model_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_model_access(params: ModelAccessParam, ctx: Context) -> dict[str, Any]:
     """Update model access grants. ADMIN ONLY.
 
@@ -943,19 +1115,19 @@ async def update_model_access(params: ModelAccessParam, ctx: Context) -> dict[st
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_knowledge_bases(ctx: Context) -> dict[str, Any]:
     """List all knowledge bases with their IDs, names, and descriptions."""
     return await get_client().list_knowledge(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_knowledge_base(params: KnowledgeIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a knowledge base including file list."""
     return await get_client().get_knowledge(params.knowledge_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_knowledge_base(params: KnowledgeCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new knowledge base for RAG."""
     token = get_user_token()
@@ -965,7 +1137,7 @@ async def create_knowledge_base(params: KnowledgeCreateParam, ctx: Context) -> d
     )
 
 
-@mcp.tool()
+@tool()
 async def update_knowledge_base(params: KnowledgeUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a knowledge base's name or description."""
     token = get_user_token()
@@ -988,7 +1160,7 @@ async def update_knowledge_base(params: KnowledgeUpdateParam, ctx: Context) -> d
     )
 
 
-@mcp.tool()
+@tool()
 async def update_knowledge_access(params: KnowledgeAccessParam, ctx: Context) -> dict[str, Any]:
     """Update access grants for a knowledge base."""
     token = get_user_token()
@@ -1004,7 +1176,7 @@ async def update_knowledge_access(params: KnowledgeAccessParam, ctx: Context) ->
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_knowledge_base(params: KnowledgeIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a knowledge base and all its files. WARNING: Cannot be undone!"""
     return await get_client().delete_knowledge(params.knowledge_id, get_user_token())
@@ -1015,13 +1187,13 @@ async def delete_knowledge_base(params: KnowledgeIdParam, ctx: Context) -> dict[
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_files(ctx: Context) -> dict[str, Any]:
     """List all uploaded files with metadata."""
     return await get_client().list_files(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def upload_file(params: FileUploadParam, ctx: Context) -> dict[str, Any]:
     """Upload a local file, optionally linking it to a knowledge base."""
     return await get_client().upload_file(
@@ -1033,25 +1205,25 @@ async def upload_file(params: FileUploadParam, ctx: Context) -> dict[str, Any]:
     )
 
 
-@mcp.tool()
+@tool()
 async def search_files(params: FileSearchParam, ctx: Context) -> dict[str, Any]:
     """Search files by filename pattern. Supports wildcards like *.pdf"""
     return await get_client().search_files(params.filename, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_file(params: FileIdParam, ctx: Context) -> dict[str, Any]:
     """Get metadata for a specific file."""
     return await get_client().get_file(params.file_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_file_content(params: FileIdParam, ctx: Context) -> dict[str, Any]:
     """Get the extracted text content from a file."""
     return await get_client().get_file_content(params.file_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def add_knowledge_file(params: KnowledgeFileParam, ctx: Context) -> dict[str, Any]:
     """Add a file to a knowledge collection.
 
@@ -1094,19 +1266,19 @@ async def add_knowledge_file(params: KnowledgeFileParam, ctx: Context) -> dict[s
     )
 
 
-@mcp.tool()
+@tool()
 async def update_file_content(params: FileContentParam, ctx: Context) -> dict[str, Any]:
     """Update the extracted text content of a file."""
     return await get_client().update_file_content(params.file_id, params.content, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_file(params: FileIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a file."""
     return await get_client().delete_file(params.file_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_all_files(ctx: Context) -> dict[str, Any]:
     """Delete all files. ADMIN ONLY. WARNING: Cannot be undone!"""
     return await get_client().delete_all_files(get_user_token())
@@ -1117,13 +1289,13 @@ async def delete_all_files(ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_prompts(ctx: Context) -> dict[str, Any]:
     """List all prompt templates."""
     return await get_client().list_prompts(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_prompt(params: PromptCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new prompt template triggered by a command."""
     return await get_client().create_prompt(
@@ -1131,13 +1303,13 @@ async def create_prompt(params: PromptCreateParam, ctx: Context) -> dict[str, An
     )
 
 
-@mcp.tool()
+@tool()
 async def get_prompt(params: PromptIdParam, ctx: Context) -> dict[str, Any]:
     """Get a prompt template by its stable ID."""
     return await get_client().get_prompt(params.prompt_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_prompt(params: PromptUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a prompt template."""
     return await get_client().update_prompt(
@@ -1145,7 +1317,7 @@ async def update_prompt(params: PromptUpdateParam, ctx: Context) -> dict[str, An
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_prompt(params: PromptIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a prompt template."""
     return await get_client().delete_prompt(params.prompt_id, get_user_token())
@@ -1156,13 +1328,13 @@ async def delete_prompt(params: PromptIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_memories(ctx: Context) -> dict[str, Any]:
     """List all your stored memories."""
     return await get_client().list_memories(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def add_memory(params: MemoryAddParam, ctx: Context) -> dict[str, Any]:
     """Add a new memory to your memory store."""
     token = get_user_token()
@@ -1170,13 +1342,13 @@ async def add_memory(params: MemoryAddParam, ctx: Context) -> dict[str, Any]:
     return await audit_mutation("memory.add", "current-user", ["content"], result, token)
 
 
-@mcp.tool()
+@tool()
 async def query_memories(params: MemoryQueryParam, ctx: Context) -> dict[str, Any]:
     """Search memories using semantic similarity."""
     return await get_client().query_memories(params.content, params.k, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_memory(params: MemoryUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update an existing memory."""
     token = get_user_token()
@@ -1184,19 +1356,19 @@ async def update_memory(params: MemoryUpdateParam, ctx: Context) -> dict[str, An
     return await audit_mutation("memory.update", params.memory_id, ["content"], result, token)
 
 
-@mcp.tool()
+@tool()
 async def delete_memory(params: MemoryIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a specific memory."""
     return await get_client().delete_memory(params.memory_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_all_memories(ctx: Context) -> dict[str, Any]:
     """Delete all your memories. WARNING: Cannot be undone!"""
     return await get_client().delete_all_memories(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def reset_memories(ctx: Context) -> dict[str, Any]:
     """Re-embed all memories in the vector database."""
     return await get_client().reset_memories(get_user_token())
@@ -1207,43 +1379,43 @@ async def reset_memories(ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_chats(ctx: Context) -> dict[str, Any]:
     """List your chats."""
     return await get_client().list_chats(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
     """Get a chat's details and message history."""
     return await get_client().get_chat(params.chat_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a chat."""
     return await get_client().delete_chat(params.chat_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_all_chats(ctx: Context) -> dict[str, Any]:
     """Delete all your chats. WARNING: Cannot be undone!"""
     return await get_client().delete_all_chats(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def archive_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
     """Archive a chat."""
     return await get_client().archive_chat(params.chat_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def share_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
     """Share a chat (make it publicly accessible)."""
     return await get_client().share_chat(params.chat_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def clone_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
     """Clone a shared chat to your account."""
     return await get_client().clone_chat(params.chat_id, get_user_token())
@@ -1254,13 +1426,13 @@ async def clone_chat(params: ChatIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_folders(ctx: Context) -> dict[str, Any]:
     """List folders/projects accessible to the current user."""
     return await get_client().list_folders(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_folder(params: FolderCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a folder/project with optional instructions and Knowledge Base collections."""
     token = get_user_token()
@@ -1284,13 +1456,13 @@ async def create_folder(params: FolderCreateParam, ctx: Context) -> dict[str, An
     )
 
 
-@mcp.tool()
+@tool()
 async def get_folder(params: FolderIdParam, ctx: Context) -> dict[str, Any]:
     """Get full folder/project details, including instructions and attached knowledge."""
     return await get_client().get_folder(params.folder_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_folder(params: FolderUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update folder/project instructions or knowledge, or rename the folder.
 
@@ -1321,7 +1493,7 @@ async def update_folder(params: FolderUpdateParam, ctx: Context) -> dict[str, An
     return await audit_mutation("folder.update", params.folder_id, changed_fields, result, token)
 
 
-@mcp.tool()
+@tool()
 async def delete_folder(params: FolderIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a folder."""
     return await get_client().delete_folder(params.folder_id, get_user_token())
@@ -1332,19 +1504,19 @@ async def delete_folder(params: FolderIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_tools(ctx: Context) -> dict[str, Any]:
     """List all available tools (MCP, OpenAPI, custom)."""
     return await get_client().list_tools(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_tool(params: ToolIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a specific tool."""
     return await get_client().get_tool(params.tool_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_tool(params: ToolCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new custom tool with Python code."""
     return await get_client().create_tool(
@@ -1352,7 +1524,7 @@ async def create_tool(params: ToolCreateParam, ctx: Context) -> dict[str, Any]:
     )
 
 
-@mcp.tool()
+@tool()
 async def update_tool(params: ToolUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a tool's name or code."""
     return await get_client().update_tool(
@@ -1360,7 +1532,7 @@ async def update_tool(params: ToolUpdateParam, ctx: Context) -> dict[str, Any]:
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_tool(params: ToolIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a tool."""
     return await get_client().delete_tool(params.tool_id, get_user_token())
@@ -1371,19 +1543,19 @@ async def delete_tool(params: ToolIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_functions(ctx: Context) -> dict[str, Any]:
     """List all functions (filters and pipes)."""
     return await get_client().list_functions(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_function(params: FunctionIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a specific function."""
     return await get_client().get_function(params.function_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_function(params: FunctionCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new function (filter or pipe) with Python code."""
     return await get_client().create_function(
@@ -1391,7 +1563,7 @@ async def create_function(params: FunctionCreateParam, ctx: Context) -> dict[str
     )
 
 
-@mcp.tool()
+@tool()
 async def update_function(params: FunctionUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a function's name or code."""
     return await get_client().update_function(
@@ -1399,13 +1571,13 @@ async def update_function(params: FunctionUpdateParam, ctx: Context) -> dict[str
     )
 
 
-@mcp.tool()
+@tool()
 async def toggle_function(params: FunctionIdParam, ctx: Context) -> dict[str, Any]:
     """Toggle a function's enabled/disabled state."""
     return await get_client().toggle_function(params.function_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def delete_function(params: FunctionIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a function."""
     return await get_client().delete_function(params.function_id, get_user_token())
@@ -1416,25 +1588,25 @@ async def delete_function(params: FunctionIdParam, ctx: Context) -> dict[str, An
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_notes(ctx: Context) -> dict[str, Any]:
     """List all your notes."""
     return await get_client().list_notes(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_note(params: NoteCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new note with markdown content."""
     return await get_client().create_note(params.title, params.content, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_note(params: NoteIdParam, ctx: Context) -> dict[str, Any]:
     """Get a specific note by ID."""
     return await get_client().get_note(params.note_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_note(params: NoteUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a note's title or content."""
     return await get_client().update_note(
@@ -1442,7 +1614,7 @@ async def update_note(params: NoteUpdateParam, ctx: Context) -> dict[str, Any]:
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_note(params: NoteIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a note."""
     return await get_client().delete_note(params.note_id, get_user_token())
@@ -1453,25 +1625,25 @@ async def delete_note(params: NoteIdParam, ctx: Context) -> dict[str, Any]:
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def list_channels(ctx: Context) -> dict[str, Any]:
     """List all team chat channels."""
     return await get_client().list_channels(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def create_channel(params: ChannelCreateParam, ctx: Context) -> dict[str, Any]:
     """Create a new team chat channel."""
     return await get_client().create_channel(params.name, params.description, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_channel(params: ChannelIdParam, ctx: Context) -> dict[str, Any]:
     """Get details for a specific channel."""
     return await get_client().get_channel(params.channel_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_channel(params: ChannelUpdateParam, ctx: Context) -> dict[str, Any]:
     """Update a channel's name or description."""
     return await get_client().update_channel(
@@ -1479,13 +1651,13 @@ async def update_channel(params: ChannelUpdateParam, ctx: Context) -> dict[str, 
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_channel(params: ChannelIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a channel and all its messages."""
     return await get_client().delete_channel(params.channel_id, get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_channel_messages(params: ChannelMessagesParam, ctx: Context) -> dict[str, Any]:
     """Get messages from a channel with pagination."""
     return await get_client().get_channel_messages(
@@ -1493,7 +1665,7 @@ async def get_channel_messages(params: ChannelMessagesParam, ctx: Context) -> di
     )
 
 
-@mcp.tool()
+@tool()
 async def post_channel_message(params: ChannelMessageParam, ctx: Context) -> dict[str, Any]:
     """Post a message to a channel. Optionally reply to a parent message."""
     return await get_client().post_channel_message(
@@ -1501,7 +1673,7 @@ async def post_channel_message(params: ChannelMessageParam, ctx: Context) -> dic
     )
 
 
-@mcp.tool()
+@tool()
 async def delete_channel_message(params: ChannelMessageIdParam, ctx: Context) -> dict[str, Any]:
     """Delete a message from a channel."""
     return await get_client().delete_channel_message(
@@ -1514,13 +1686,13 @@ async def delete_channel_message(params: ChannelMessageIdParam, ctx: Context) ->
 # =============================================================================
 
 
-@mcp.tool()
+@tool()
 async def get_system_config(ctx: Context) -> dict[str, Any]:
     """Get system configuration. ADMIN ONLY."""
-    return await get_client().get_config(get_user_token())
+    return redact(await get_client().get_config(get_user_token()))
 
 
-@mcp.tool()
+@tool()
 async def get_default_prompt_suggestions(ctx: Context) -> dict[str, Any]:
     """Get instance-wide default quick-start suggestions. ADMIN ONLY.
 
@@ -1530,7 +1702,7 @@ async def get_default_prompt_suggestions(ctx: Context) -> dict[str, Any]:
     return await get_client().get_default_prompt_suggestions(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def update_default_prompt_suggestions(
     params: DefaultPromptSuggestionsParam, ctx: Context
 ) -> dict[str, Any]:
@@ -1551,34 +1723,34 @@ async def update_default_prompt_suggestions(
     )
 
 
-@mcp.tool()
+@tool()
 async def export_config(ctx: Context) -> dict[str, Any]:
     """Export full system configuration. ADMIN ONLY."""
-    return await get_client().export_config(get_user_token())
+    return redact(await get_client().export_config(get_user_token()))
 
 
-@mcp.tool()
+@tool()
 async def get_banners(ctx: Context) -> dict[str, Any]:
     """Get system notification banners."""
     return await get_client().get_banners(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_models_config(ctx: Context) -> dict[str, Any]:
     """Get default models configuration. ADMIN ONLY."""
     return await get_client().get_models_config(get_user_token())
 
 
-@mcp.tool()
+@tool()
 async def get_model_connections(ctx: Context) -> dict[str, Any]:
     """List provider connection IDs, discovery settings, and Model IDs. ADMIN ONLY.
 
     API keys and other credential fields are never returned.
     """
-    return await get_client().get_model_connections(get_user_token())
+    return redact(await get_client().get_model_connections(get_user_token()))
 
 
-@mcp.tool()
+@tool()
 async def set_connection_model_ids(
     params: ConnectionModelIdsUpdateParam, ctx: Context
 ) -> dict[str, Any]:
@@ -1598,7 +1770,7 @@ async def set_connection_model_ids(
         token,
     )
     if not result.get("changed", True):
-        return result
+        return redact(result)
     return await audit_mutation(
         "provider_connection.model_ids.update",
         f"connection:{params.connection_index}",
@@ -1608,13 +1780,13 @@ async def set_connection_model_ids(
     )
 
 
-@mcp.tool()
+@tool()
 async def get_tool_servers(ctx: Context) -> dict[str, Any]:
-    """Get tool server (MCP/OpenAPI) connections. ADMIN ONLY."""
-    return await get_client().get_tool_servers(get_user_token())
+    """Get tool server (MCP/OpenAPI) connections. ADMIN ONLY. Keys are masked."""
+    return redact(await get_client().get_tool_servers(get_user_token()))
 
 
-@mcp.tool()
+@tool()
 async def update_tool_server_config(
     params: ToolServerConfigUpdateParam, ctx: Context
 ) -> dict[str, Any]:
@@ -1640,6 +1812,66 @@ async def update_tool_server_config(
         result,
         token,
     )
+
+
+@tool()
+async def get_config_namespace(params: ConfigNamespaceParam, ctx: Context) -> dict[str, Any]:
+    """Get every stored setting under one namespace, keyed by dotted name. ADMIN ONLY.
+
+    Credentials are masked. Use the key names it returns with ``set_config_values``.
+    """
+    return redact(await get_client().get_config_namespace(params.namespace, get_user_token()))
+
+
+@tool()
+async def get_config_values(params: ConfigKeysParam, ctx: Context) -> dict[str, Any]:
+    """Get the stored value of each named setting. ADMIN ONLY. Credentials are masked.
+
+    Keys listed under ``not_stored`` have no saved value: Open WebUI uses its default.
+    """
+    return redact(await get_client().get_config_values(params.keys, get_user_token()))
+
+
+@tool()
+async def set_config_values(params: ConfigSetParam, ctx: Context) -> dict[str, Any]:
+    """Change named settings, leaving every other setting as stored. ADMIN ONLY.
+
+    Each value is read back after saving; the result lists before and after for
+    each changed key (credentials masked). MFA settings are refused: Open WebUI
+    changes them only from a signed-in browser session.
+    """
+    token = get_user_token()
+    result = await get_client().set_config_values(
+        params.values, params.allow_new_keys, api_key=token
+    )
+    return await audit_mutation(
+        "config.update", "config", sorted(params.values), result, token
+    )
+
+
+@tool()
+async def update_tool_server(params: ToolServerUpdateParam, ctx: Context) -> dict[str, Any]:
+    """Change one tool server connection (on/off, name, description, URL, tool filter). ADMIN ONLY.
+
+    Every other connection, and every field not given, stays as stored; the
+    saved list is read back to confirm it. Keys are masked in the result.
+    """
+    token = get_user_token()
+    result = await get_client().update_tool_server(
+        params.server_id,
+        enabled=params.enabled,
+        name=params.name,
+        description=params.description,
+        url=params.url,
+        function_name_filter_list=params.function_name_filter_list,
+        api_key=token,
+    )
+    changed = [
+        field
+        for field in ("enabled", "name", "description", "url", "function_name_filter_list")
+        if getattr(params, field) is not None
+    ]
+    return await audit_mutation("tool_server.update", params.server_id, changed, result, token)
 
 
 # =============================================================================
@@ -1675,8 +1907,11 @@ def main():
     """Run the MCP server."""
     import sys
 
-    if not os.getenv("OPENWEBUI_URL"):
-        print("ERROR: OPENWEBUI_URL environment variable is required", file=sys.stderr)
+    if not (os.getenv("OPENWEBUI_URL") or os.getenv("WEBUI_URL")):
+        print(
+            "ERROR: OPENWEBUI_URL (or WEBUI_URL) environment variable is required",
+            file=sys.stderr,
+        )
         print("Example: export OPENWEBUI_URL=https://ai.example.com", file=sys.stderr)
         sys.exit(1)
 

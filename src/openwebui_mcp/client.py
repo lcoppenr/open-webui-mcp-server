@@ -14,6 +14,10 @@ import httpx
 KNOWLEDGE_PAGE_SIZE = 30
 
 
+class OpenWebUIRouteError(RuntimeError):
+    """An API path that Open WebUI does not serve (its web app answered instead)."""
+
+
 class OpenWebUIClient:
     """Client for the Open WebUI management API."""
 
@@ -28,12 +32,18 @@ class OpenWebUIClient:
             base_url: Open WebUI base URL (e.g., https://ai.example.com)
             api_key: User's API key/Bearer token for authentication
         """
-        self.base_url = (base_url or os.getenv("OPENWEBUI_URL", "")).rstrip("/")
-        self.api_key = api_key or os.getenv("OPENWEBUI_API_KEY", "")
+        self.base_url = (
+            base_url or os.getenv("OPENWEBUI_URL") or os.getenv("WEBUI_URL", "")
+        ).rstrip("/")
+        self.api_key = (
+            api_key or os.getenv("OPENWEBUI_API_KEY") or os.getenv("WEBUI_API_KEY", "")
+        )
         self._provider_config_lock = asyncio.Lock()
 
         if not self.base_url:
-            raise ValueError("Open WebUI URL required. Set OPENWEBUI_URL env var or pass base_url.")
+            raise ValueError(
+                "Open WebUI URL required. Set OPENWEBUI_URL (or WEBUI_URL) or pass base_url."
+            )
 
     def _get_headers(self, api_key: Optional[str] = None) -> dict[str, str]:
         """Get request headers with authentication."""
@@ -84,7 +94,13 @@ class OpenWebUIClient:
             )
             self._raise_for_status(response)
 
-            if response.headers.get("content-type", "").startswith("application/json"):
+            content_type = response.headers.get("content-type", "")
+            if content_type.startswith("text/html"):
+                raise OpenWebUIRouteError(
+                    f"{method} {path} returned an HTML page instead of JSON: Open WebUI has "
+                    "no API route at this path (its web app answered instead)."
+                )
+            if content_type.startswith("application/json"):
                 payload = response.json()
                 return payload if isinstance(payload, dict) else {"data": payload}
             return {"text": response.text}
@@ -192,8 +208,20 @@ class OpenWebUIClient:
         return await self.get(f"/api/v1/users/{self._path_id(user_id)}", api_key)
 
     async def get_current_user(self, api_key: Optional[str] = None) -> dict:
-        """Get the currently authenticated user."""
-        return await self.get("/api/v1/auths/", api_key)
+        """Get what the authenticated caller may do.
+
+        Open WebUI serves the session profile (``GET /api/v1/auths/``) to a signed-in
+        browser session only and answers an API key with 403, so this returns the
+        caller's effective permissions, which an API key may read.
+        """
+        permissions = await self.get("/api/v1/users/permissions", api_key)
+        return {
+            "permissions": permissions,
+            "note": (
+                "Open WebUI returns the full profile (id, email, role) only to a "
+                "signed-in browser session; API keys get permissions only."
+            ),
+        }
 
     async def update_user_role(
         self, user_id: str, role: str, api_key: Optional[str] = None
@@ -401,6 +429,36 @@ class OpenWebUIClient:
         """Get a specific custom model by ID."""
         return await self.get(f"/api/v1/models/model?id={quote(model_id, safe='')}", api_key)
 
+    async def get_model_details(self, model_id: str, api_key: Optional[str] = None) -> dict:
+        """Get a model's saved settings, or its live entry when nothing is saved.
+
+        Workspace models and connection models whose settings were edited have a saved
+        record. A connection model that was never edited has none; then the entry from
+        the effective model list is returned with ``stored_record: False``.
+        """
+        record = await self._get_model_record_or_none(model_id, api_key)
+        if record is not None:
+            return {**record, "stored_record": True}
+        effective = await self.get("/api/models", api_key)
+        for model in effective.get("data", []) or []:
+            if isinstance(model, dict) and model.get("id") == model_id:
+                return {
+                    "id": model_id,
+                    "stored_record": False,
+                    "note": "No saved settings for this model; showing its live entry.",
+                    "effective": model,
+                }
+        raise ValueError(f"Model {model_id!r} was not found")
+
+    async def get_model_history(
+        self, model_id: str, page: int = 1, api_key: Optional[str] = None
+    ) -> dict:
+        """List saved versions of a model's settings, newest first."""
+        return await self.get(
+            f"/api/v1/models/model/history?id={quote(model_id, safe='')}&page={int(page)}",
+            api_key,
+        )
+
     async def create_model(
         self,
         id: str,
@@ -440,8 +498,25 @@ class OpenWebUIClient:
         knowledge_ids: Optional[list[str]] = None,
         api_key: Optional[str] = None,
     ) -> dict:
-        """Update a model while preserving fields required by the current API."""
-        existing = await self.get_model(model_id, api_key)
+        """Update a model while preserving fields required by the current API.
+
+        Open WebUI replaces ``meta`` and ``params`` wholesale, so the saved record is
+        read first and the change merged into it. A connection model with no saved
+        record gets one created from its provider entry, as the admin UI does.
+        """
+        existing = await self._get_model_record_or_none(model_id, api_key)
+        create = existing is None
+        if create:
+            base = await self._get_base_model(model_id, api_key)
+            existing = {
+                "id": model_id,
+                "name": base.get("name") or model_id,
+                "base_model_id": None,
+                "meta": {},
+                "params": {},
+                "access_grants": None,
+                "is_active": True,
+            }
         model_params = {**(existing.get("params") or {}), **(params or {})}
         for key in clear_params or []:
             model_params.pop(key, None)
@@ -476,7 +551,8 @@ class OpenWebUIClient:
         }
         if access_grants is not None:
             data["access_grants"] = access_grants
-        return await self.post("/api/v1/models/model/update", api_key, json=data)
+        endpoint = "/api/v1/models/create" if create else "/api/v1/models/model/update"
+        return await self.post(endpoint, api_key, json=data)
 
     async def _get_model_record_or_none(
         self, model_id: str, api_key: Optional[str] = None
@@ -1415,6 +1491,142 @@ class OpenWebUIClient:
         if model_order is not None:
             data["MODEL_ORDER_LIST"] = model_order
         return await self.post("/api/v1/configs/models", api_key, json=data)
+
+    # Settings that Open WebUI changes only for a signed-in browser session.
+    HUMAN_SESSION_CONFIG_KEYS = frozenset(
+        {"auth.mfa.enable", "auth.mfa.allow_oauth_bypass", "auth.mfa.allow_trusted_header_bypass"}
+    )
+
+    async def get_config_namespace(self, namespace: str, api_key: Optional[str] = None) -> dict:
+        """Get every setting under a dotted namespace such as ``rag`` or ``ui`` (admin only)."""
+        return await self.get(f"/api/v1/configs/namespace/{self._path_id(namespace)}", api_key)
+
+    async def get_config_values(self, keys: list[str], api_key: Optional[str] = None) -> dict:
+        """Get the stored value of each named setting (admin only).
+
+        Keys with no stored row are listed under ``not_stored``: Open WebUI is using
+        its default for them.
+        """
+        config = await self.get("/api/v1/configs/export", api_key)
+        values = {key: config[key] for key in keys if key in config}
+        return {"values": values, "not_stored": [key for key in keys if key not in config]}
+
+    async def set_config_values(
+        self,
+        values: dict[str, Any],
+        allow_new_keys: bool = False,
+        api_key: Optional[str] = None,
+    ) -> dict:
+        """Set named settings and confirm each one by reading it back (admin only).
+
+        Open WebUI stores only the keys sent, so other settings are untouched. A key
+        with no stored row is refused unless ``allow_new_keys`` is set, so a typo
+        cannot create a setting nobody reads.
+        """
+        if not values:
+            raise ValueError("No settings given")
+        blocked = sorted(set(values) & self.HUMAN_SESSION_CONFIG_KEYS)
+        if blocked:
+            raise ValueError(
+                f"{', '.join(blocked)} can only be changed from a signed-in browser session"
+            )
+        before = await self.get("/api/v1/configs/export", api_key)
+        unknown = sorted(key for key in values if key not in before)
+        if unknown and not allow_new_keys:
+            raise ValueError(
+                "No stored setting named "
+                + ", ".join(unknown)
+                + "; check the key with get_config_namespace, or set allow_new_keys"
+            )
+        await self.post("/api/v1/configs/import", api_key, json={"config": values})
+        after = await self.get("/api/v1/configs/export", api_key)
+        mismatched = sorted(key for key, value in values.items() if after.get(key) != value)
+        if mismatched:
+            raise RuntimeError(
+                "Open WebUI did not keep the new value for " + ", ".join(mismatched)
+            )
+        return {
+            "changed": {
+                key: {"before": before.get(key), "after": after.get(key)}
+                for key in values
+                if before.get(key) != after.get(key)
+            },
+            "unchanged": sorted(key for key in values if before.get(key) == after.get(key)),
+            "new_keys": unknown,
+        }
+
+    @staticmethod
+    def _normalize_connection(connection: dict[str, Any]) -> dict[str, Any]:
+        """Fill the defaults Open WebUI adds when it saves a tool server connection."""
+        defaults = {
+            "type": "openapi",
+            "auth_type": None,
+            "forward_cookies": False,
+            "headers": None,
+            "key": None,
+            "config": None,
+            "info": None,
+        }
+        return {**defaults, **connection}
+
+    async def update_tool_server(
+        self,
+        server_id: str,
+        enabled: Optional[bool] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        url: Optional[str] = None,
+        function_name_filter_list: Optional[list[str]] = None,
+        api_key: Optional[str] = None,
+    ) -> dict:
+        """Change one tool server connection and keep every other one as stored (admin only).
+
+        Open WebUI replaces the whole connection list on save, so the list is read,
+        the one entry changed and the whole list written back, then read again to
+        confirm nothing else moved.
+        """
+        current = await self.get_tool_servers(api_key)
+        connections = current.get("TOOL_SERVER_CONNECTIONS", []) or []
+        matches = [
+            index
+            for index, connection in enumerate(connections)
+            if (connection.get("info") or {}).get("id") == server_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"Expected exactly one tool server with id {server_id!r}")
+        index = matches[0]
+        original = json.loads(json.dumps(connections))
+        connection = connections[index]
+        if url is not None:
+            connection["url"] = url
+        if enabled is not None:
+            connection.setdefault("config", {})["enable"] = enabled
+        if function_name_filter_list is not None:
+            connection.setdefault("config", {})[
+                "function_name_filter_list"
+            ] = function_name_filter_list
+        if name is not None:
+            connection.setdefault("info", {})["name"] = name
+        if description is not None:
+            connection.setdefault("info", {})["description"] = description
+
+        await self.set_tool_servers(connections, api_key)
+        saved = (await self.get_tool_servers(api_key)).get("TOOL_SERVER_CONNECTIONS", []) or []
+        others_before = [
+            self._normalize_connection(c) for i, c in enumerate(original) if i != index
+        ]
+        others_after = [
+            self._normalize_connection(c)
+            for c in saved
+            if (c.get("info") or {}).get("id") != server_id
+        ]
+        if others_before != others_after:
+            raise RuntimeError(
+                "Other tool server connections changed during the update; check them in "
+                "Open WebUI's admin settings"
+            )
+        updated = [c for c in saved if (c.get("info") or {}).get("id") == server_id]
+        return {"server": updated[0] if updated else None, "before": original[index]}
 
     async def get_tool_servers(self, api_key: Optional[str] = None) -> dict:
         """Get tool server connections (admin only)."""
